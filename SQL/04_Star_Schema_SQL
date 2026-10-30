@@ -1,0 +1,211 @@
+USE CallCenterAnalytics;
+GO
+
+-- ================================================================
+-- 1. CREACIÓN DE LAS DIMENSIONES
+-- ================================================================
+IF OBJECT_ID('dbo.DimDate', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DimDate (
+        date_key DATE NOT NULL PRIMARY KEY,
+        [year] INT NOT NULL,
+        month_number INT NOT NULL,
+        month_name NVARCHAR(20) NOT NULL,
+        weekday_number INT NOT NULL,
+        weekday_name NVARCHAR(20) NOT NULL
+    );
+END;
+GO
+
+IF OBJECT_ID('dbo.DimSite', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DimSite (
+        site_key INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        site NVARCHAR(80) NOT NULL UNIQUE,
+        country NVARCHAR(70) NOT NULL,
+        region NVARCHAR(10) NOT NULL
+    );
+END;
+GO
+
+IF OBJECT_ID('dbo.DimQueue', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DimQueue (
+        queue_key INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        queue_name NVARCHAR(80) NOT NULL UNIQUE
+    );
+END;
+GO
+
+IF OBJECT_ID('dbo.DimChannel', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DimChannel (
+        channel_key INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        channel NVARCHAR(15) NOT NULL UNIQUE
+    );
+END;
+GO
+
+-- ================================================================
+-- 2. CREACIÓN DE LA TABLA DE HECHOS
+-- ================================================================
+IF OBJECT_ID('dbo.FactOperations', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.FactOperations (
+        source_row_id INT NOT NULL PRIMARY KEY,
+        date_key DATE NOT NULL,
+        site_key INT NOT NULL,
+        queue_key INT NOT NULL,
+        channel_key INT NOT NULL,
+        [hour] INT NOT NULL,
+        business_unit NVARCHAR(35),
+        all_units_filter NVARCHAR(30),
+        queue_units_filter NVARCHAR(40),
+        asu_tier_filter NVARCHAR(20),
+        planned_volume INT,
+        offered_volume INT,
+        handled_volume INT,
+        abandoned_volume INT,
+        backlog_volume INT,
+        aht_seconds INT,
+        handle_time_total BIGINT,
+        wait_time_avg DECIMAL(18,9),
+        shrinkage_percent INT,
+        required_fte INT,
+        agent_count INT,
+        utilization_percent INT,
+        active_agents INT,
+        service_level_percent INT,
+        occupancy_percent INT,
+        alerta_volumen BIT,
+        alerta_tiempo BIT,
+        alerta_personal BIT,
+        canal_segun_cola NVARCHAR(30),
+        validacion_canal NVARCHAR(30),
+        tier_segun_cola NVARCHAR(20),
+        alerta_tier BIT,
+        alerta_fecha_futura BIT,
+        alerta_canal BIT,
+        requiere_revision BIT,
+        FOREIGN KEY (date_key) REFERENCES dbo.DimDate(date_key),
+        FOREIGN KEY (site_key) REFERENCES dbo.DimSite(site_key),
+        FOREIGN KEY (queue_key) REFERENCES dbo.DimQueue(queue_key),
+        FOREIGN KEY (channel_key) REFERENCES dbo.DimChannel(channel_key)
+    );
+END;
+GO
+
+-- ================================================================
+-- 3. CARGAR LAS DIMENSIONES DESDE dbo.Operations
+-- ================================================================
+-- DimDate: un dia por fila, incluyendo dias sin registros.
+-- DATEFIRST=1: lunes=1, domingo=7.
+SET DATEFIRST 1;
+DECLARE @fecha DATE = (SELECT MIN([date]) FROM dbo.Operations);
+DECLARE @fin DATE = (SELECT MAX([date]) FROM dbo.Operations);
+
+WHILE @fecha <= @fin
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM dbo.DimDate WHERE date_key = @fecha)
+    BEGIN
+        INSERT INTO dbo.DimDate
+            (date_key, [year], month_number, month_name, weekday_number, weekday_name)
+        VALUES
+            (@fecha, YEAR(@fecha), MONTH(@fecha), DATENAME(MONTH, @fecha),
+             DATEPART(WEEKDAY, @fecha), DATENAME(WEEKDAY, @fecha));
+    END;
+    SET @fecha = DATEADD(DAY, 1, @fecha);
+END;
+GO
+
+-- Los sitios del dataset actual corresponden a un unico pais y region por sitio.
+INSERT INTO dbo.DimSite (site, country, region)
+SELECT DISTINCT o.site, o.country, o.region
+FROM dbo.Operations AS o
+WHERE NOT EXISTS (
+    SELECT 1 FROM dbo.DimSite AS d WHERE d.site = o.site
+);
+GO
+
+-- En la dimension de colas NO inferimos canal ni Tier a partir del nombre.
+-- Los conflictos entre columnas se conservan como alertas en FactOperations.
+INSERT INTO dbo.DimQueue (queue_name)
+SELECT DISTINCT o.queue_name
+FROM dbo.Operations AS o
+WHERE NOT EXISTS (
+    SELECT 1 FROM dbo.DimQueue AS d WHERE d.queue_name = o.queue_name
+);
+GO
+
+-- El canal es el que realmente aparece registrado en la columna channel.
+INSERT INTO dbo.DimChannel (channel)
+SELECT DISTINCT o.channel
+FROM dbo.Operations AS o
+WHERE NOT EXISTS (
+    SELECT 1 FROM dbo.DimChannel AS d WHERE d.channel = o.channel
+);
+GO
+
+-- ================================================================
+-- 4. CARGAR LA TABLA DE HECHOS
+-- ================================================================
+INSERT INTO dbo.FactOperations (
+    source_row_id, date_key, site_key, queue_key, channel_key,
+    [hour], business_unit, all_units_filter, queue_units_filter, asu_tier_filter,
+    planned_volume, offered_volume, handled_volume, abandoned_volume,
+    backlog_volume, aht_seconds, handle_time_total, wait_time_avg,
+    shrinkage_percent, required_fte, agent_count, utilization_percent,
+    active_agents, service_level_percent, occupancy_percent,
+    alerta_volumen, alerta_tiempo, alerta_personal, canal_segun_cola,
+    validacion_canal, tier_segun_cola, alerta_tier,
+    alerta_fecha_futura, alerta_canal, requiere_revision
+)
+SELECT
+    o.source_row_id, o.[date], s.site_key, q.queue_key, c.channel_key,
+    o.[hour], o.business_unit, o.all_units_filter, o.queue_units_filter,
+    o.asu_tier_filter, o.planned_volume, o.offered_volume, o.handled_volume,
+    o.abandoned_volume, o.backlog_volume, o.aht_seconds, o.handle_time_total,
+    o.wait_time_avg, o.shrinkage_percent, o.required_fte, o.agent_count,
+    o.utilization_percent, o.active_agents, o.service_level_percent,
+    o.occupancy_percent, o.alerta_volumen, o.alerta_tiempo,
+    o.alerta_personal, o.canal_segun_cola, o.validacion_canal,
+    o.tier_segun_cola, o.alerta_tier, o.alerta_fecha_futura,
+    o.alerta_canal, o.requiere_revision
+FROM dbo.Operations AS o
+INNER JOIN dbo.DimSite AS s ON s.site = o.site
+INNER JOIN dbo.DimQueue AS q ON q.queue_name = o.queue_name
+INNER JOIN dbo.DimChannel AS c ON c.channel = o.channel
+INNER JOIN dbo.DimDate AS d ON d.date_key = o.[date]
+WHERE NOT EXISTS (
+    SELECT 1 FROM dbo.FactOperations AS f
+    WHERE f.source_row_id = o.source_row_id
+);
+GO
+
+-- ================================================================
+-- 5. REVISAR LOS RESULTADOS
+-- ================================================================
+SELECT 'Operations' AS tabla, COUNT(*) AS filas FROM dbo.Operations
+UNION ALL SELECT 'FactOperations', COUNT(*) FROM dbo.FactOperations
+UNION ALL SELECT 'DimDate', COUNT(*) FROM dbo.DimDate
+UNION ALL SELECT 'DimSite', COUNT(*) FROM dbo.DimSite
+UNION ALL SELECT 'DimQueue', COUNT(*) FROM dbo.DimQueue
+UNION ALL SELECT 'DimChannel', COUNT(*) FROM dbo.DimChannel;
+GO
+
+-- Comprobacion principal: los totales deben ser identicos.
+SELECT 'Origen' AS tabla, SUM(offered_volume) AS ofrecidos,
+       SUM(handled_volume) AS atendidos, SUM(abandoned_volume) AS abandonados
+FROM dbo.Operations
+UNION ALL
+SELECT 'Modelo estrella', SUM(offered_volume),
+       SUM(handled_volume), SUM(abandoned_volume)
+FROM dbo.FactOperations;
+GO
+
+-- Hay que obtener 0; indica que ninguna fila quedo fuera de la tabla de hechos.
+SELECT COUNT(*) AS filas_sin_cargar
+FROM dbo.Operations AS o
+LEFT JOIN dbo.FactOperations AS f ON o.source_row_id = f.source_row_id
+WHERE f.source_row_id IS NULL;
+GO
